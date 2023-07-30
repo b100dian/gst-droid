@@ -183,6 +183,8 @@ gst_droid_buffer_pool_bind_media_buffer (GstBufferPool * pool,
   GstMemory *mem;
 
   if (!GST_IS_DROID_BUFFER_POOL (pool)) {
+    GST_WARNING_OBJECT (pool, "Pool is not a GstDroidBufferPool");
+
     return FALSE;
   }
 

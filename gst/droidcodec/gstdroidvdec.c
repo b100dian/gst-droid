@@ -927,6 +927,8 @@ gst_droidvdec_decide_allocation (GstVideoDecoder * decoder, GstQuery * query)
     guint size;
     gint count = gst_query_get_n_allocation_pools (query);
 
+    GST_INFO_OBJECT(features, "Vlad: Contains media_queue_buffer, count %d", count);
+
     for (i = 0; i < count; ++i) {
       GstAllocator *allocator;
       GstStructure *config;
@@ -937,8 +939,10 @@ gst_droidvdec_decide_allocation (GstVideoDecoder * decoder, GstQuery * query)
       if (allocator
           && g_strcmp0 (allocator->mem_type,
               GST_ALLOCATOR_DROID_MEDIA_BUFFER) == 0) {
+        GST_INFO_OBJECT(pool, "Vlad: Allocator mem_type %s, i/count %d", allocator->mem_type, i);
         break;
       } else {
+        GST_INFO_OBJECT(pool, "Vlad: unref pool mem_type %s,, i/count %d", allocator->mem_type, i);
         gst_object_unref (pool);
         pool = NULL;
       }
