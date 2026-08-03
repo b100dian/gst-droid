@@ -23,7 +23,8 @@
  *
  * GStreamer source element that captures the Android display via
  * the HWC plugin's BufferQueue and encodes it to H.264 using the
- * platform's hardware video encoder in metadata-input mode.
+ * platform's hardware video encoder. Copy mode is the default; metadata
+ * input is an opt-in compatibility mode.
  *
  * Pipeline (simplified):
  *
@@ -32,7 +33,7 @@
  *   GraphicBuffer(RGBA)                 droidscreencapsrc
  *     │                                       │
  *     ├── BufferQueue::queueBuffer            ├── ScreenCaptureMediaSource
- *     │                                       │     (metadata mode)
+ *     │                                   │     (RGBA copy by default)
  *     │                                       ├── droid_media_codec_create_encoder_raw()
  *     │                                       │     → HW encoder (OMX/Codec2)
  *     │                                       ├── Poll thread → encoded H.264 NAL
@@ -40,7 +41,7 @@
  *
  * Usage:
  *   gst-launch-1.0 droidscreencapsrc target-bitrate=8000000 \
- *       fps=30 color-format=2130708361 ! h264parse ! ...
+ *       fps=30 ! h264parse ! ...
  */
 
 #ifdef HAVE_CONFIG_H
@@ -63,6 +64,8 @@ GST_DEBUG_CATEGORY_EXTERN (gst_droid_screencapsrc_debug);
 #define DEFAULT_TARGET_BITRATE  8000000
 #define DEFAULT_FPS             30
 #define DEFAULT_COLOR_FORMAT    OMX_COLOR_FormatAndroidOpaque
+#define DEFAULT_METADATA_MODE   FALSE
+#define OUTPUT_QUEUE_LIMIT      10
 
 /* Retry parameters for consumer lookup */
 #define CONSUMER_RETRY_MS       100
@@ -74,6 +77,7 @@ enum
     PROP_TARGET_BITRATE,
     PROP_FPS,
     PROP_COLOR_FORMAT,
+    PROP_METADATA_MODE,
 };
 
 /* Pad template — raw H.264 byte-stream output */
@@ -108,6 +112,14 @@ static void gst_droidscreencapsrc_eos (void *user);
 
 #define gst_droidscreencapsrc_parent_class parent_class
 G_DEFINE_TYPE (GstDroidScreenCapSrc, gst_droidscreencapsrc, GST_TYPE_PUSH_SRC);
+
+typedef struct {
+    guint8 *data;
+    gsize size;
+    gint64 timestamp_ns;
+    gboolean sync;
+    gboolean codec_config;
+} EncodedFrame;
 
 /* ----------------------------------------------------------------
  * GObject boilerplate
@@ -154,6 +166,12 @@ gst_droidscreencapsrc_class_init (GstDroidScreenCapSrcClass * klass)
             "OMX color format for encoder input", 0, G_MAXINT32,
             DEFAULT_COLOR_FORMAT,
             G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+    g_object_class_install_property (gobject_class, PROP_METADATA_MODE,
+        g_param_spec_boolean ("metadata-mode", "Metadata mode",
+            "Pass GraphicBuffer metadata to encoders that support it",
+            DEFAULT_METADATA_MODE,
+            G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 }
 
 static void
@@ -164,16 +182,27 @@ gst_droidscreencapsrc_init (GstDroidScreenCapSrc * src)
     src->target_bitrate = DEFAULT_TARGET_BITRATE;
     src->fps = DEFAULT_FPS;
     src->color_format = DEFAULT_COLOR_FORMAT;
+    src->metadata_mode = DEFAULT_METADATA_MODE;
 
     g_mutex_init (&src->output_lock);
     g_cond_init (&src->output_cond);
     src->output_queue = g_queue_new ();
 
     src->eos = FALSE;
+    src->flushing = FALSE;
     src->running = FALSE;
 
     gst_base_src_set_format (GST_BASE_SRC (src), GST_FORMAT_TIME);
     gst_base_src_set_live (GST_BASE_SRC (src), TRUE);
+}
+
+static void
+gst_droidscreencapsrc_free_frame (EncodedFrame *ef)
+{
+    if (ef) {
+        g_free (ef->data);
+        g_free (ef);
+    }
 }
 
 static void
@@ -183,13 +212,17 @@ gst_droidscreencapsrc_finalize (GObject * object)
 
     GST_DEBUG_OBJECT (src, "finalize");
 
-    g_mutex_clear (&src->output_lock);
-    g_cond_clear (&src->output_cond);
-
     if (src->output_queue) {
-        g_queue_free_full (src->output_queue, g_free);
+        while (!g_queue_is_empty (src->output_queue)) {
+            gst_droidscreencapsrc_free_frame (
+                (EncodedFrame *) g_queue_pop_head (src->output_queue));
+        }
+        g_queue_free (src->output_queue);
         src->output_queue = NULL;
     }
+
+    g_mutex_clear (&src->output_lock);
+    g_cond_clear (&src->output_cond);
 
     G_OBJECT_CLASS (parent_class)->finalize (object);
 }
@@ -209,6 +242,9 @@ gst_droidscreencapsrc_set_property (GObject * object, guint prop_id,
             break;
         case PROP_COLOR_FORMAT:
             src->color_format = g_value_get_int (value);
+            break;
+        case PROP_METADATA_MODE:
+            src->metadata_mode = g_value_get_boolean (value);
             break;
         default:
             G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -232,6 +268,9 @@ gst_droidscreencapsrc_get_property (GObject * object, guint prop_id,
         case PROP_COLOR_FORMAT:
             g_value_set_int (value, src->color_format);
             break;
+        case PROP_METADATA_MODE:
+            g_value_set_boolean (value, src->metadata_mode);
+            break;
         default:
             G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
             break;
@@ -241,14 +280,6 @@ gst_droidscreencapsrc_get_property (GObject * object, guint prop_id,
 /* ----------------------------------------------------------------
  * Encoder callbacks
  * ---------------------------------------------------------------- */
-
-typedef struct {
-    guint8 *data;
-    gsize size;
-    gint64 timestamp_ns;
-    gboolean sync;
-    gboolean codec_config;
-} EncodedFrame;
 
 static void
 gst_droidscreencapsrc_data_available (void *user,
@@ -269,6 +300,15 @@ gst_droidscreencapsrc_data_available (void *user,
     ef->codec_config = frame->codec_config;
 
     g_mutex_lock (&src->output_lock);
+    if (src->flushing || !src->running) {
+        g_mutex_unlock (&src->output_lock);
+        gst_droidscreencapsrc_free_frame (ef);
+        return;
+    }
+    while (g_queue_get_length (src->output_queue) >= OUTPUT_QUEUE_LIMIT) {
+        EncodedFrame *old = (EncodedFrame *) g_queue_pop_head (src->output_queue);
+        gst_droidscreencapsrc_free_frame (old);
+    }
     g_queue_push_tail (src->output_queue, ef);
     g_cond_signal (&src->output_cond);
     g_mutex_unlock (&src->output_lock);
@@ -309,7 +349,12 @@ gst_droidscreencapsrc_start (GstBaseSrc * bsrc)
 
     GST_DEBUG_OBJECT (src, "start");
 
+    g_mutex_lock (&src->output_lock);
     src->eos = FALSE;
+    src->flushing = FALSE;
+    src->running = FALSE;
+    g_cond_broadcast (&src->output_cond);
+    g_mutex_unlock (&src->output_lock);
 
     /* 1. Fetch consumer via Binder — retry with backoff */
     while (src->queue == NULL && retries < CONSUMER_MAX_RETRIES) {
@@ -346,10 +391,13 @@ gst_droidscreencapsrc_start (GstBaseSrc * bsrc)
         src->color_format,
         src->target_bitrate,
         src->fps,
+        src->metadata_mode,
         &cb,
         src);
 
     if (src->encoder == NULL) {
+        droid_media_screen_capture_queue_destroy (src->queue);
+        src->queue = NULL;
         GST_ELEMENT_ERROR (src, LIBRARY, INIT, (NULL),
             ("Failed to create screen capture encoder"));
         return FALSE;
@@ -361,11 +409,16 @@ gst_droidscreencapsrc_start (GstBaseSrc * bsrc)
             ("Failed to start screen capture encoder"));
         screen_capture_encoder_destroy (src->encoder);
         src->encoder = NULL;
+        droid_media_screen_capture_queue_destroy (src->queue);
+        src->queue = NULL;
         return FALSE;
     }
 
+    g_mutex_lock (&src->output_lock);
     src->running = TRUE;
-    GST_INFO_OBJECT (src, "started successfully");
+    g_mutex_unlock (&src->output_lock);
+    GST_INFO_OBJECT (src, "started successfully (metadata-mode=%d)",
+        src->metadata_mode);
 
     return TRUE;
 }
@@ -377,7 +430,12 @@ gst_droidscreencapsrc_stop (GstBaseSrc * bsrc)
 
     GST_DEBUG_OBJECT (src, "stop");
 
+    g_mutex_lock (&src->output_lock);
     src->running = FALSE;
+    src->flushing = TRUE;
+    src->eos = TRUE;
+    g_cond_broadcast (&src->output_cond);
+    g_mutex_unlock (&src->output_lock);
 
     /* Stop encoder + join poll thread */
     if (src->encoder) {
@@ -386,16 +444,19 @@ gst_droidscreencapsrc_stop (GstBaseSrc * bsrc)
         src->encoder = NULL;
     }
 
-    src->queue = NULL;
+    if (src->queue) {
+        droid_media_screen_capture_queue_destroy (src->queue);
+        src->queue = NULL;
+    }
 
     /* Drain any remaining frames in the output queue */
     g_mutex_lock (&src->output_lock);
     while (!g_queue_is_empty (src->output_queue)) {
         EncodedFrame *ef = (EncodedFrame *) g_queue_pop_head (src->output_queue);
-        g_free (ef->data);
-        g_free (ef);
+        gst_droidscreencapsrc_free_frame (ef);
     }
     src->eos = FALSE;
+    src->flushing = FALSE;
     g_mutex_unlock (&src->output_lock);
 
     return TRUE;
@@ -415,8 +476,14 @@ gst_droidscreencapsrc_create (GstPushSrc * psrc, GstBuffer ** outbuf)
     g_mutex_lock (&src->output_lock);
 
     /* Wait until a frame is available or EOS */
-    while (g_queue_is_empty (src->output_queue) && !src->eos) {
+    while (g_queue_is_empty (src->output_queue) && !src->eos &&
+           !src->flushing) {
         g_cond_wait (&src->output_cond, &src->output_lock);
+    }
+
+    if (src->flushing && g_queue_is_empty (src->output_queue)) {
+        g_mutex_unlock (&src->output_lock);
+        return GST_FLOW_FLUSHING;
     }
 
     if (src->eos && g_queue_is_empty (src->output_queue)) {
@@ -431,8 +498,7 @@ gst_droidscreencapsrc_create (GstPushSrc * psrc, GstBuffer ** outbuf)
     /* Build GstBuffer */
     buf = gst_buffer_new_allocate (NULL, ef->size, NULL);
     if (!buf) {
-        g_free (ef->data);
-        g_free (ef);
+        gst_droidscreencapsrc_free_frame (ef);
         return GST_FLOW_ERROR;
     }
 
@@ -443,8 +509,7 @@ gst_droidscreencapsrc_create (GstPushSrc * psrc, GstBuffer ** outbuf)
             gst_buffer_unmap (buf, &info);
         } else {
             gst_buffer_unref (buf);
-            g_free (ef->data);
-            g_free (ef);
+            gst_droidscreencapsrc_free_frame (ef);
             return GST_FLOW_ERROR;
         }
     }
@@ -470,8 +535,7 @@ gst_droidscreencapsrc_create (GstPushSrc * psrc, GstBuffer ** outbuf)
         ef->size, GST_TIME_ARGS (ef->timestamp_ns),
         ef->sync, ef->codec_config);
 
-    g_free (ef->data);
-    g_free (ef);
+    gst_droidscreencapsrc_free_frame (ef);
 
     *outbuf = buf;
     return ret;
