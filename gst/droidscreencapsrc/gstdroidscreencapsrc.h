@@ -52,6 +52,7 @@ struct _GstDroidScreenCapSrc {
     gint target_bitrate;
     gint fps;
     gint color_format;
+    gboolean metadata_mode;
 
     /* Output queue — filled by encoder callback, drained by create() */
     GMutex output_lock;
@@ -59,6 +60,7 @@ struct _GstDroidScreenCapSrc {
     GQueue *output_queue;
 
     gboolean eos;
+    gboolean flushing;
     gboolean running;
 };
 
