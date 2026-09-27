@@ -38,30 +38,74 @@ G_BEGIN_DECLS
 
 typedef struct _GstDroidScreenCapSrc GstDroidScreenCapSrc;
 typedef struct _GstDroidScreenCapSrcClass GstDroidScreenCapSrcClass;
+typedef struct _GstDroidScreenCapFrame GstDroidScreenCapFrame;
 
 struct _GstDroidScreenCapSrc {
     GstPushSrc parent;
 
-    /* Capture consumer */
-    void *queue;
-
-    /* Encoder pipeline */
-    void *encoder;
-
     /* Properties */
+    gint width;
+    gint height;
     gint target_bitrate;
     gint fps;
-    gint color_format;
-    gboolean metadata_mode;
 
-    /* Output queue — filled by encoder callback, drained by create() */
+    /* Dimensions resolved at start() (explicit or discovered) */
+    gint enc_width;
+    gint enc_height;
+
+    /* ScreenCaptureSurfaceEncoder *, owned by the element between start()
+     * and stop(). Only touched from the streaming/state-change threads. */
+    void *encoder;
+
+    /*
+     * output_lock protects everything below. Callbacks from the encoder drain
+     * thread, create() on the streaming thread, send_event() and
+     * unlock()/stop() on application threads all take it. Encoder
+     * start/finish/stop/destroy are never called while it is held.
+     */
     GMutex output_lock;
     GCond output_cond;
-    GQueue *output_queue;
 
-    gboolean eos;
-    gboolean flushing;
-    gboolean running;
+    /* Finalized frames ready for create(); bounded by frames and bytes. */
+    GQueue *output_queue;
+    gsize queue_bytes;
+
+    /* Newest ordinary access unit, held back until its successor arrives so
+     * that duration = next_pts - pts can be assigned. */
+    GstDroidScreenCapFrame *pending;
+
+    /* Latest codec configuration (SPS/PPS), retained outside the queue so an
+     * overload drop can never lose the only copy. It is prepended in-band to
+     * every sync frame that does not already carry parameter sets; it is
+     * never pushed as a separate buffer (see data_available). */
+    guint8 *config_data;
+    gsize config_size;
+
+    /* Timestamp normalization: MediaCodec PTS are absolute CLOCK_MONOTONIC
+     * microseconds; GstBuffer PTS = (pts_us - first_pts_us) * 1000. */
+    gboolean have_first_pts;
+    gint64 first_pts_us;
+    gint64 last_pts_us;
+
+    /* Overload handling */
+    gboolean waiting_for_keyframe;
+    guint dropped_frames;
+    gsize dropped_bytes;
+    guint overload_episodes;
+    guint duplicate_pts_frames; /* AUs discarded for repeating the last PTS */
+
+    /* Lifecycle state */
+    gboolean running;        /* start() succeeded, stop() not yet run */
+    gboolean flushing;       /* unlock()/stop(): create() must return */
+    gboolean eos_requested;  /* downstream EOS received via send_event() */
+    gboolean finish_started; /* streaming thread has begun encoder finish */
+    gboolean eos;            /* all remaining data is in output_queue */
+    gint64 stop_time_us;     /* CLOCK_MONOTONIC us when EOS was requested */
+    gint error;              /* first encoder error, 0 if none */
+    gboolean error_posted;
+
+    /* Statistics for logs */
+    guint64 frames_out;
 };
 
 struct _GstDroidScreenCapSrcClass {
