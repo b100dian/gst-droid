@@ -106,7 +106,7 @@ plugin_init (GstPlugin * plugin)
       GST_TYPE_DROIDADEC);
   ok &= gst_element_register (plugin, "droidaenc", GST_RANK_PRIMARY + 1,
       GST_TYPE_DROIDAENC);
-  ok &= gst_element_register (plugin, "droidscreencapsrc", GST_RANK_PRIMARY,
+  ok &= gst_element_register (plugin, "droidscreencapsrc", GST_RANK_NONE,
       GST_TYPE_DROIDSCREENCAPSRC);
 
   CAMERA_STARTUP_PLUGIN ("registered codecs ok=%d", ok);
