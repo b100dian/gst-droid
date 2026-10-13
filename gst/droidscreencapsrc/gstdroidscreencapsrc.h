@@ -27,7 +27,8 @@
 
 G_BEGIN_DECLS
 
-#define GST_TYPE_DROIDSCREENCAPSRC (gst_droidscreencapsrc_get_type())
+#define GST_TYPE_DROIDSCREENCAPSRC \
+  (gst_droidscreencapsrc_get_type())
 #define GST_DROIDSCREENCAPSRC(obj) \
   (G_TYPE_CHECK_INSTANCE_CAST((obj), GST_TYPE_DROIDSCREENCAPSRC, GstDroidScreenCapSrc))
 #define GST_DROIDSCREENCAPSRC_CLASS(klass) \
@@ -40,75 +41,58 @@ G_BEGIN_DECLS
 typedef struct _GstDroidScreenCapSrc GstDroidScreenCapSrc;
 typedef struct _GstDroidScreenCapSrcClass GstDroidScreenCapSrcClass;
 
-struct _GstDroidScreenCapSrc {
-    GstPushSrc parent;
+struct _GstDroidScreenCapSrc
+{
+  GstPushSrc parent;
 
-    /* Properties */
-    gint width;
-    gint height;
-    gint target_bitrate;
-    gint fps;
+  gint width;
+  gint height;
+  gint target_bitrate;
+  gint fps;
 
-    /* Owned by the element between start() and stop(). Only touched from
-     * the streaming/state-change threads. */
-    DroidMediaScreenCapture *capture;
+  /* between start() and stop() */
+  DroidMediaScreenCapture *capture;
 
-    /*
-     * output_lock protects everything below. Callbacks from the encoder drain
-     * thread, create() on the streaming thread, send_event() and
-     * unlock()/stop() on application threads all take it. Encoder
-     * start/finish/stop/destroy are never called while it is held.
-     */
-    GMutex output_lock;
-    GCond output_cond;
+  /* Protects everything below. Never held while calling into capture. */
+  GMutex output_lock;
+  GCond output_cond;
 
-    /* Finalized frames ready for create(); bounded by frames and bytes. */
-    GQueue *output_queue;
-    gsize queue_bytes;
+  GQueue *output_queue;
+  gsize queue_bytes;
+  GstBuffer *pending;           /* waits for the next AU to get a duration */
+  guint8 *config_data;          /* newest SPS/PPS */
+  gsize config_size;
 
-    /* Newest ordinary access unit, held back until its successor arrives so
-     * that duration = next_pts - pts can be assigned. */
-    GstBuffer *pending;
+  /* PTS = ts - first_ts, both in CLOCK_MONOTONIC ns */
+  gboolean have_first_pts;
+  gint64 first_ts;
+  gint64 last_ts;
 
-    /* Latest codec configuration (SPS/PPS), retained outside the queue so an
-     * overload drop can never lose the only copy. It is prepended in-band to
-     * every sync frame that does not already carry parameter sets; it is
-     * never pushed as a separate buffer (see data_available). */
-    guint8 *config_data;
-    gsize config_size;
+  /* overload: drop up to the next IDR */
+  gboolean waiting_for_keyframe;
+  guint dropped_frames;
+  gsize dropped_bytes;
+  guint overload_episodes;
+  guint duplicate_pts_frames;
 
-    /* Timestamp normalization: codec timestamps are absolute CLOCK_MONOTONIC
-     * nanoseconds; GstBuffer PTS = ts - first_ts. */
-    gboolean have_first_pts;
-    gint64 first_ts;
-    gint64 last_ts;
+  gboolean running;
+  gboolean flushing;
+  gboolean eos_requested;
+  gboolean finish_started;
+  gboolean eos;                 /* everything left is in output_queue */
+  gint64 stop_time;             /* CLOCK_MONOTONIC ns of the EOS request */
+  gint error;
+  gboolean error_posted;
 
-    /* Overload handling */
-    gboolean waiting_for_keyframe;
-    guint dropped_frames;
-    gsize dropped_bytes;
-    guint overload_episodes;
-    guint duplicate_pts_frames; /* AUs discarded for repeating the last PTS */
-
-    /* Lifecycle state */
-    gboolean running;        /* start() succeeded, stop() not yet run */
-    gboolean flushing;       /* unlock()/stop(): create() must return */
-    gboolean eos_requested;  /* downstream EOS received via send_event() */
-    gboolean finish_started; /* streaming thread has begun encoder finish */
-    gboolean eos;            /* all remaining data is in output_queue */
-    gint64 stop_time;        /* CLOCK_MONOTONIC ns when EOS was requested */
-    gint error;              /* first encoder error, 0 if none */
-    gboolean error_posted;
-
-    /* Statistics for logs */
-    guint64 frames_out;
+  guint64 frames_out;
 };
 
-struct _GstDroidScreenCapSrcClass {
-    GstPushSrcClass parent_class;
+struct _GstDroidScreenCapSrcClass
+{
+  GstPushSrcClass parent_class;
 };
 
-GType gst_droidscreencapsrc_get_type(void);
+GType gst_droidscreencapsrc_get_type (void);
 
 G_END_DECLS
 
