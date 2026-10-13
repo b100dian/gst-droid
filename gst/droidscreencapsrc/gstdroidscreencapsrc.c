@@ -109,14 +109,6 @@ GST_STATIC_PAD_TEMPLATE ("src",
         "stream-format = (string) byte-stream, "
         "alignment = (string) au"));
 
-struct _GstDroidScreenCapFrame {
-    guint8 *data;
-    gsize size;
-    GstClockTime pts;
-    GstClockTime duration;
-    gboolean sync;
-};
-
 /* ----------------------------------------------------------------
  * Prototypes
  * ---------------------------------------------------------------- */
@@ -257,32 +249,21 @@ gst_droidscreencapsrc_init (GstDroidScreenCapSrc * src)
  * ---------------------------------------------------------------- */
 
 static void
-gst_droidscreencapsrc_free_frame (GstDroidScreenCapFrame * f)
-{
-    if (f) {
-        g_free (f->data);
-        g_free (f);
-    }
-}
-
-static void
 gst_droidscreencapsrc_clear_queue_locked (GstDroidScreenCapSrc * src)
 {
-    while (!g_queue_is_empty (src->output_queue)) {
-        gst_droidscreencapsrc_free_frame (
-            (GstDroidScreenCapFrame *) g_queue_pop_head (src->output_queue));
-    }
+    GstBuffer *buf;
+
+    while ((buf = g_queue_pop_head (src->output_queue)))
+        gst_buffer_unref (buf);
     src->queue_bytes = 0;
 }
-
 
 /* Reset every per-run field. Requires output_lock. */
 static void
 gst_droidscreencapsrc_reset_run_state_locked (GstDroidScreenCapSrc * src)
 {
     gst_droidscreencapsrc_clear_queue_locked (src);
-    gst_droidscreencapsrc_free_frame (src->pending);
-    src->pending = NULL;
+    gst_buffer_replace (&src->pending, NULL);
     g_free (src->config_data);
     src->config_data = NULL;
     src->config_size = 0;
@@ -318,48 +299,52 @@ gst_droidscreencapsrc_set_error_locked (GstDroidScreenCapSrc * src, gint err)
 }
 
 /*
- * Copy an encoded sync frame, prepending the retained SPS/PPS unless the
- * access unit already begins with them (the encoder is configured with
- * prepend-sps-pps-to-idr-frames, but that is a request, not a guarantee).
- * Requires output_lock for config_data.
+ * Copy an access unit into a new buffer. A sync frame gets the retained
+ * SPS/PPS prepended unless it already begins with them: the encoder is
+ * configured with prepend-sps-pps-to-idr-frames, but that is a request,
+ * not a guarantee. Requires output_lock.
  */
-static guint8 *
-gst_droidscreencapsrc_copy_sync_frame_locked (GstDroidScreenCapSrc * src,
-    const guint8 * data, gsize size, gsize * out_size)
+static GstBuffer *
+gst_droidscreencapsrc_wrap_locked (GstDroidScreenCapSrc * src,
+    DroidMediaCodecData * encoded)
 {
-    guint8 *buf;
+    gsize prefix = 0;
+    GstBuffer *buf;
 
-    if (src->config_data == NULL || src->config_size == 0 ||
-        (size >= src->config_size &&
-         memcmp (data, src->config_data, src->config_size) == 0)) {
-        *out_size = size;
-        return g_memdup2 (data, size);
-    }
+    if (encoded->sync && src->config_data != NULL &&
+        !((gsize) encoded->data.size >= src->config_size &&
+          memcmp (encoded->data.data, src->config_data,
+              src->config_size) == 0))
+        prefix = src->config_size;
 
-    buf = g_malloc (src->config_size + size);
-    memcpy (buf, src->config_data, src->config_size);
-    memcpy (buf + src->config_size, data, size);
-    *out_size = src->config_size + size;
-    GST_DEBUG_OBJECT (src, "prepended %" G_GSIZE_FORMAT " bytes of codec "
-        "config to a sync frame", src->config_size);
+    buf = gst_buffer_new_allocate (NULL, prefix + encoded->data.size, NULL);
+    if (buf == NULL)
+        return NULL;
+
+    if (prefix)
+        gst_buffer_fill (buf, 0, src->config_data, prefix);
+    gst_buffer_fill (buf, prefix, encoded->data.data, encoded->data.size);
+
+    if (!encoded->sync)
+        GST_BUFFER_FLAG_SET (buf, GST_BUFFER_FLAG_DELTA_UNIT);
+
     return buf;
 }
 
 /*
- * Enqueue a finalized ordinary frame, applying the overload policy:
- * on reaching a bound, drop everything queued plus this frame, and discard
- * incoming frames until the next sync frame. Takes ownership of @f.
+ * Queue a finished access unit, applying the overload policy: on reaching a
+ * bound, drop everything queued plus this one, and discard incoming access
+ * units until the next sync frame. Takes ownership of @buf.
  */
 static void
-gst_droidscreencapsrc_enqueue_ordinary_locked (GstDroidScreenCapSrc * src,
-    GstDroidScreenCapFrame * f)
+gst_droidscreencapsrc_enqueue_locked (GstDroidScreenCapSrc * src,
+    GstBuffer * buf)
 {
     guint queued = g_queue_get_length (src->output_queue);
+    gsize size = gst_buffer_get_size (buf);
 
     if (queued >= OUTPUT_QUEUE_MAX_FRAMES ||
-        src->queue_bytes + f->size > OUTPUT_QUEUE_MAX_BYTES) {
-        gsize dropped_bytes = src->queue_bytes + f->size;
-
+        src->queue_bytes + size > OUTPUT_QUEUE_MAX_BYTES) {
         src->overload_episodes++;
         GST_WARNING_OBJECT (src,
             "output queue bound reached (%u frames, %" G_GSIZE_FORMAT
@@ -368,16 +353,16 @@ gst_droidscreencapsrc_enqueue_ordinary_locked (GstDroidScreenCapSrc * src,
             queued, src->queue_bytes, OUTPUT_QUEUE_MAX_FRAMES,
             OUTPUT_QUEUE_MAX_BYTES, src->overload_episodes, queued);
 
-        gst_droidscreencapsrc_clear_queue_locked (src);
-        gst_droidscreencapsrc_free_frame (f);
         src->dropped_frames += queued + 1;
-        src->dropped_bytes += dropped_bytes;
+        src->dropped_bytes += src->queue_bytes + size;
+        gst_droidscreencapsrc_clear_queue_locked (src);
+        gst_buffer_unref (buf);
         src->waiting_for_keyframe = TRUE;
         return;
     }
 
-    g_queue_push_tail (src->output_queue, f);
-    src->queue_bytes += f->size;
+    g_queue_push_tail (src->output_queue, buf);
+    src->queue_bytes += size;
     g_cond_signal (&src->output_cond);
 }
 
@@ -388,30 +373,32 @@ gst_droidscreencapsrc_enqueue_ordinary_locked (GstDroidScreenCapSrc * src,
 static void
 gst_droidscreencapsrc_finalize_pending_locked (GstDroidScreenCapSrc * src)
 {
-    GstDroidScreenCapFrame *f = src->pending;
-    GstClockTime nominal = gst_util_uint64_scale_int (GST_SECOND, 1, src->fps);
+    GstBuffer *buf = src->pending;
+    GstClockTime pts;
     gint64 rel;
 
-    if (f == NULL)
+    if (buf == NULL)
         return;
     src->pending = NULL;
 
+    pts = GST_BUFFER_PTS (buf);
     rel = (src->stop_time != 0 ? src->stop_time :
         g_get_monotonic_time () * 1000) - src->first_ts;
 
-    if (rel > 0 && (GstClockTime) rel > f->pts) {
-        f->duration = (GstClockTime) rel - f->pts;
+    if (rel > 0 && (GstClockTime) rel > pts) {
+        GST_BUFFER_DURATION (buf) = (GstClockTime) rel - pts;
         GST_INFO_OBJECT (src, "final frame PTS %" GST_TIME_FORMAT
             " duration %" GST_TIME_FORMAT " (to recording stop)",
-            GST_TIME_ARGS (f->pts), GST_TIME_ARGS (f->duration));
+            GST_TIME_ARGS (pts), GST_TIME_ARGS (GST_BUFFER_DURATION (buf)));
     } else {
-        f->duration = nominal;
+        GST_BUFFER_DURATION (buf) =
+            gst_util_uint64_scale_int (GST_SECOND, 1, src->fps);
         GST_WARNING_OBJECT (src, "recording stop time is not later than the "
-            "final PTS %" GST_TIME_FORMAT "; using one nominal frame period %"
-            GST_TIME_FORMAT, GST_TIME_ARGS (f->pts), GST_TIME_ARGS (nominal));
+            "final PTS %" GST_TIME_FORMAT "; using one nominal frame period",
+            GST_TIME_ARGS (pts));
     }
 
-    gst_droidscreencapsrc_enqueue_ordinary_locked (src, f);
+    gst_droidscreencapsrc_enqueue_locked (src, buf);
 }
 
 /* ----------------------------------------------------------------
@@ -498,7 +485,8 @@ gst_droidscreencapsrc_data_available (void *data,
     DroidMediaCodecData * encoded)
 {
     GstDroidScreenCapSrc *src = GST_DROIDSCREENCAPSRC (data);
-    GstDroidScreenCapFrame *f;
+    GstClockTime pts;
+    GstBuffer *buf;
 
     GST_LOG_OBJECT (src, "data_available: %" G_GSIZE_FORMAT " bytes, ts %"
         G_GINT64_FORMAT " sync=%d codec_config=%d",
@@ -515,8 +503,9 @@ gst_droidscreencapsrc_data_available (void *data,
     if (encoded->codec_config) {
         /* Retain the newest SPS/PPS; it is prepended in-band to sync frames. */
         g_free (src->config_data);
-        src->config_data = g_memdup2 (encoded->data.data, encoded->data.size);
         src->config_size = encoded->data.size;
+        src->config_data = g_malloc (src->config_size);
+        memcpy (src->config_data, encoded->data.data, src->config_size);
         GST_INFO_OBJECT (src, "retained codec config (%" G_GSIZE_FORMAT
             " bytes)", (gsize) encoded->data.size);
         g_mutex_unlock (&src->output_lock);
@@ -549,44 +538,42 @@ gst_droidscreencapsrc_data_available (void *data,
     }
 
     src->last_ts = encoded->ts;
-
-    f = g_new0 (GstDroidScreenCapFrame, 1);
-    if (encoded->sync) {
-        f->data = gst_droidscreencapsrc_copy_sync_frame_locked (src,
-            encoded->data.data, encoded->data.size, &f->size);
-    } else {
-        f->data = g_memdup2 (encoded->data.data, encoded->data.size);
-        f->size = encoded->data.size;
-    }
-    f->pts = encoded->ts - src->first_ts;
-    f->duration = GST_CLOCK_TIME_NONE;
-    f->sync = encoded->sync;
+    pts = encoded->ts - src->first_ts;
 
     /* One-frame lookahead: the previous frame's duration is the gap to
      * this one. */
     if (src->pending) {
-        GstDroidScreenCapFrame *prev = src->pending;
+        GstBuffer *prev = src->pending;
+
         src->pending = NULL;
-        prev->duration = f->pts > prev->pts ? f->pts - prev->pts : 0;
-        gst_droidscreencapsrc_enqueue_ordinary_locked (src, prev);
+        GST_BUFFER_DURATION (prev) = pts - GST_BUFFER_PTS (prev);
+        gst_droidscreencapsrc_enqueue_locked (src, prev);
     }
 
     if (src->waiting_for_keyframe) {
-        if (!f->sync) {
+        if (!encoded->sync) {
             src->dropped_frames++;
-            src->dropped_bytes += f->size;
-            gst_droidscreencapsrc_free_frame (f);
+            src->dropped_bytes += encoded->data.size;
             g_mutex_unlock (&src->output_lock);
             return;
         }
         GST_WARNING_OBJECT (src, "overload episode %u ended: dropped %u "
             "frames / %" G_GSIZE_FORMAT " bytes; resuming at keyframe PTS %"
             GST_TIME_FORMAT, src->overload_episodes, src->dropped_frames,
-            src->dropped_bytes, GST_TIME_ARGS (f->pts));
+            src->dropped_bytes, GST_TIME_ARGS (pts));
         src->waiting_for_keyframe = FALSE;
     }
 
-    src->pending = f;
+    buf = gst_droidscreencapsrc_wrap_locked (src, encoded);
+    if (buf == NULL) {
+        GST_ERROR_OBJECT (src, "cannot allocate a %" G_GSIZE_FORMAT
+            " byte buffer", (gsize) encoded->data.size);
+        gst_droidscreencapsrc_set_error_locked (src, -ENOMEM);
+        g_mutex_unlock (&src->output_lock);
+        return;
+    }
+    GST_BUFFER_PTS (buf) = pts;
+    src->pending = buf;
     g_mutex_unlock (&src->output_lock);
 }
 
@@ -873,9 +860,7 @@ static GstFlowReturn
 gst_droidscreencapsrc_create (GstPushSrc * psrc, GstBuffer ** outbuf)
 {
     GstDroidScreenCapSrc *src = GST_DROIDSCREENCAPSRC (psrc);
-    GstDroidScreenCapFrame *f = NULL;
     GstBuffer *buf;
-    GstMapInfo info;
 
     g_mutex_lock (&src->output_lock);
 
@@ -885,9 +870,9 @@ gst_droidscreencapsrc_create (GstPushSrc * psrc, GstBuffer ** outbuf)
             return GST_FLOW_FLUSHING;
         }
 
-        if (!g_queue_is_empty (src->output_queue)) {
-            f = (GstDroidScreenCapFrame *) g_queue_pop_head (src->output_queue);
-            src->queue_bytes -= f->size;
+        buf = g_queue_pop_head (src->output_queue);
+        if (buf != NULL) {
+            src->queue_bytes -= gst_buffer_get_size (buf);
             break;
         }
 
@@ -923,38 +908,10 @@ gst_droidscreencapsrc_create (GstPushSrc * psrc, GstBuffer ** outbuf)
         g_cond_wait (&src->output_cond, &src->output_lock);
     }
 
+    src->frames_out++;
     g_mutex_unlock (&src->output_lock);
 
-    buf = gst_buffer_new_allocate (NULL, f->size, NULL);
-    if (buf == NULL || !gst_buffer_map (buf, &info, GST_MAP_WRITE)) {
-        gsize size = f->size;
-
-        if (buf)
-            gst_buffer_unref (buf);
-        gst_droidscreencapsrc_free_frame (f);
-        GST_ELEMENT_ERROR (src, RESOURCE, NO_SPACE_LEFT, (NULL),
-            ("cannot allocate %" G_GSIZE_FORMAT " byte buffer", size));
-        return GST_FLOW_ERROR;
-    }
-    memcpy (info.data, f->data, f->size);
-    gst_buffer_unmap (buf, &info);
-
-    GST_BUFFER_PTS (buf) = f->pts;
-    GST_BUFFER_DTS (buf) = GST_CLOCK_TIME_NONE;
-    GST_BUFFER_DURATION (buf) = f->duration;
-
-    if (f->sync)
-        GST_BUFFER_FLAG_UNSET (buf, GST_BUFFER_FLAG_DELTA_UNIT);
-    else
-        GST_BUFFER_FLAG_SET (buf, GST_BUFFER_FLAG_DELTA_UNIT);
-    src->frames_out++;
-
-    GST_DEBUG_OBJECT (src, "pushing access unit: %" G_GSIZE_FORMAT " bytes, "
-        "PTS %" GST_TIME_FORMAT " duration %" GST_TIME_FORMAT " sync=%d",
-        f->size, GST_TIME_ARGS (f->pts), GST_TIME_ARGS (f->duration), f->sync);
-
-    gst_droidscreencapsrc_free_frame (f);
-
+    GST_DEBUG_OBJECT (src, "pushing %" GST_PTR_FORMAT, buf);
     *outbuf = buf;
     return GST_FLOW_OK;
 }

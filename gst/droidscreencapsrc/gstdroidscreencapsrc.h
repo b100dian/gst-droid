@@ -39,7 +39,6 @@ G_BEGIN_DECLS
 
 typedef struct _GstDroidScreenCapSrc GstDroidScreenCapSrc;
 typedef struct _GstDroidScreenCapSrcClass GstDroidScreenCapSrcClass;
-typedef struct _GstDroidScreenCapFrame GstDroidScreenCapFrame;
 
 struct _GstDroidScreenCapSrc {
     GstPushSrc parent;
@@ -69,7 +68,7 @@ struct _GstDroidScreenCapSrc {
 
     /* Newest ordinary access unit, held back until its successor arrives so
      * that duration = next_pts - pts can be assigned. */
-    GstDroidScreenCapFrame *pending;
+    GstBuffer *pending;
 
     /* Latest codec configuration (SPS/PPS), retained outside the queue so an
      * overload drop can never lose the only copy. It is prepended in-band to
