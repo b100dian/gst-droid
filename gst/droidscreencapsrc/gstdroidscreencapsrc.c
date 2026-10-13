@@ -30,13 +30,13 @@
  *     -> one GPU EGLImage texture blit (in lipstick)
  *     -> MediaCodec input Surface (published via sailfish.screencap)
  *     -> hardware AVC encoder
- *     -> ScreenCaptureSurfaceEncoder drain thread
+ *     -> DroidMediaScreenCapture output thread
  *     -> data_available() copies the access unit
  *     -> create() pushes video/x-h264,stream-format=byte-stream,alignment=au
  *
  * Timestamps: MediaCodec returns the presentation timestamp QPA submitted
- * (absolute CLOCK_MONOTONIC microseconds). The first ordinary access unit
- * defines the origin; every buffer PTS is (pts_us - first_pts_us) * 1000.
+ * (absolute CLOCK_MONOTONIC nanoseconds). The first ordinary access unit
+ * defines the origin; every buffer PTS is ts - first_ts.
  * Capture is event-driven, so idle periods appear as PTS gaps, not as
  * duplicate frames. To give each sample a duration, the newest ordinary
  * access unit is held back until its successor arrives (one-frame latency);
@@ -68,7 +68,6 @@
 #endif
 
 #include "gstdroidscreencapsrc.h"
-#include "screen_capture_surface_encoder.h"
 #include <errno.h>
 #include <string.h>
 
@@ -140,12 +139,10 @@ static GstFlowReturn gst_droidscreencapsrc_create (GstPushSrc * psrc,
     GstBuffer ** outbuf);
 
 /* Encoder callbacks — called from the encoder drain thread */
-static void gst_droidscreencapsrc_data_available (void *user,
-    const ScreenCaptureSurfaceEncodedFrame *frame);
-static void gst_droidscreencapsrc_format_changed (void *user, int width,
-    int height);
-static void gst_droidscreencapsrc_error (void *user, int err);
-static void gst_droidscreencapsrc_eos (void *user);
+static void gst_droidscreencapsrc_data_available (void *data,
+    DroidMediaCodecData * encoded);
+static void gst_droidscreencapsrc_error (void *data, int err);
+static void gst_droidscreencapsrc_signal_eos (void *data);
 
 #define gst_droidscreencapsrc_parent_class parent_class
 G_DEFINE_TYPE (GstDroidScreenCapSrc, gst_droidscreencapsrc, GST_TYPE_PUSH_SRC);
@@ -221,7 +218,7 @@ gst_droidscreencapsrc_init (GstDroidScreenCapSrc * src)
     src->height = DEFAULT_HEIGHT;
     src->target_bitrate = DEFAULT_TARGET_BITRATE;
     src->fps = DEFAULT_FPS;
-    src->encoder = NULL;
+    src->capture = NULL;
 
     g_mutex_init (&src->output_lock);
     g_cond_init (&src->output_cond);
@@ -232,8 +229,8 @@ gst_droidscreencapsrc_init (GstDroidScreenCapSrc * src)
     src->config_size = 0;
 
     src->have_first_pts = FALSE;
-    src->first_pts_us = 0;
-    src->last_pts_us = 0;
+    src->first_ts = 0;
+    src->last_ts = 0;
 
     src->waiting_for_keyframe = FALSE;
     src->dropped_frames = 0;
@@ -246,7 +243,7 @@ gst_droidscreencapsrc_init (GstDroidScreenCapSrc * src)
     src->eos_requested = FALSE;
     src->finish_started = FALSE;
     src->eos = FALSE;
-    src->stop_time_us = 0;
+    src->stop_time = 0;
     src->error = 0;
     src->error_posted = FALSE;
     src->frames_out = 0;
@@ -291,8 +288,8 @@ gst_droidscreencapsrc_reset_run_state_locked (GstDroidScreenCapSrc * src)
     src->config_size = 0;
 
     src->have_first_pts = FALSE;
-    src->first_pts_us = 0;
-    src->last_pts_us = 0;
+    src->first_ts = 0;
+    src->last_ts = 0;
 
     src->waiting_for_keyframe = FALSE;
     src->dropped_frames = 0;
@@ -303,7 +300,7 @@ gst_droidscreencapsrc_reset_run_state_locked (GstDroidScreenCapSrc * src)
     src->eos_requested = FALSE;
     src->finish_started = FALSE;
     src->eos = FALSE;
-    src->stop_time_us = 0;
+    src->stop_time = 0;
     src->error = 0;
     src->error_posted = FALSE;
     src->frames_out = 0;
@@ -393,18 +390,17 @@ gst_droidscreencapsrc_finalize_pending_locked (GstDroidScreenCapSrc * src)
 {
     GstDroidScreenCapFrame *f = src->pending;
     GstClockTime nominal = gst_util_uint64_scale_int (GST_SECOND, 1, src->fps);
-    gint64 stop_us;
-    gint64 rel_us;
+    gint64 rel;
 
     if (f == NULL)
         return;
     src->pending = NULL;
 
-    stop_us = src->stop_time_us != 0 ? src->stop_time_us : g_get_monotonic_time ();
-    rel_us = stop_us - src->first_pts_us;
+    rel = (src->stop_time != 0 ? src->stop_time :
+        g_get_monotonic_time () * 1000) - src->first_ts;
 
-    if (rel_us > 0 && (GstClockTime) rel_us * 1000 > f->pts) {
-        f->duration = (GstClockTime) rel_us * 1000 - f->pts;
+    if (rel > 0 && (GstClockTime) rel > f->pts) {
+        f->duration = (GstClockTime) rel - f->pts;
         GST_INFO_OBJECT (src, "final frame PTS %" GST_TIME_FORMAT
             " duration %" GST_TIME_FORMAT " (to recording stop)",
             GST_TIME_ARGS (f->pts), GST_TIME_ARGS (f->duration));
@@ -498,17 +494,16 @@ gst_droidscreencapsrc_get_property (GObject * object, guint prop_id,
  * ---------------------------------------------------------------- */
 
 static void
-gst_droidscreencapsrc_data_available (void *user,
-    const ScreenCaptureSurfaceEncodedFrame *frame)
+gst_droidscreencapsrc_data_available (void *data,
+    DroidMediaCodecData * encoded)
 {
-    GstDroidScreenCapSrc *src = GST_DROIDSCREENCAPSRC (user);
+    GstDroidScreenCapSrc *src = GST_DROIDSCREENCAPSRC (data);
     GstDroidScreenCapFrame *f;
-    gint64 rel_us;
 
-    GST_LOG_OBJECT (src, "data_available: %" G_GSIZE_FORMAT " bytes, pts=%"
-        G_GINT64_FORMAT "us sync=%d codec_config=%d flags=0x%x",
-        (gsize) frame->size, frame->timestamp_us, frame->sync,
-        frame->codec_config, frame->flags);
+    GST_LOG_OBJECT (src, "data_available: %" G_GSIZE_FORMAT " bytes, ts %"
+        G_GINT64_FORMAT " sync=%d codec_config=%d",
+        (gsize) encoded->data.size, encoded->ts, encoded->sync,
+        encoded->codec_config);
 
     g_mutex_lock (&src->output_lock);
 
@@ -517,13 +512,13 @@ gst_droidscreencapsrc_data_available (void *user,
         return;
     }
 
-    if (frame->codec_config) {
+    if (encoded->codec_config) {
         /* Retain the newest SPS/PPS; it is prepended in-band to sync frames. */
         g_free (src->config_data);
-        src->config_data = g_memdup2 (frame->data, frame->size);
-        src->config_size = frame->size;
+        src->config_data = g_memdup2 (encoded->data.data, encoded->data.size);
+        src->config_size = encoded->data.size;
         GST_INFO_OBJECT (src, "retained codec config (%" G_GSIZE_FORMAT
-            " bytes)", (gsize) frame->size);
+            " bytes)", (gsize) encoded->data.size);
         g_mutex_unlock (&src->output_lock);
         return;
     }
@@ -531,51 +526,41 @@ gst_droidscreencapsrc_data_available (void *user,
     /* Timestamp origin and monotonicity (ordinary frames only). */
     if (!src->have_first_pts) {
         src->have_first_pts = TRUE;
-        src->first_pts_us = frame->timestamp_us;
-        src->last_pts_us = frame->timestamp_us;
-        GST_INFO_OBJECT (src, "timestamp origin: codec pts %" G_GINT64_FORMAT
-            "us", src->first_pts_us);
-    } else if (frame->timestamp_us < src->last_pts_us) {
-        GST_ERROR_OBJECT (src, "regressing codec PTS %" G_GINT64_FORMAT
-            "us after %" G_GINT64_FORMAT "us", frame->timestamp_us,
-            src->last_pts_us);
+        src->first_ts = encoded->ts;
+        src->last_ts = encoded->ts;
+        GST_INFO_OBJECT (src, "timestamp origin: codec ts %" G_GINT64_FORMAT,
+            src->first_ts);
+    } else if (encoded->ts < src->last_ts) {
+        GST_ERROR_OBJECT (src, "regressing codec ts %" G_GINT64_FORMAT
+            " after %" G_GINT64_FORMAT, encoded->ts, src->last_ts);
         gst_droidscreencapsrc_set_error_locked (src, -EINVAL);
         g_mutex_unlock (&src->output_lock);
         return;
-    } else if (frame->timestamp_us == src->last_pts_us) {
+    } else if (encoded->ts == src->last_ts) {
         /* Two pictures cannot share a presentation time. The encoder has
          * been observed to emit its first IDR twice; muxers reject a
          * zero-duration sample. Keep the first, drop the repeat. */
         src->duplicate_pts_frames++;
-        GST_WARNING_OBJECT (src, "discarding access unit repeating codec PTS %"
-            G_GINT64_FORMAT "us (%" G_GSIZE_FORMAT " bytes, sync=%d)",
-            frame->timestamp_us, (gsize) frame->size, frame->sync);
+        GST_WARNING_OBJECT (src, "discarding access unit repeating codec ts %"
+            G_GINT64_FORMAT " (%" G_GSIZE_FORMAT " bytes, sync=%d)",
+            encoded->ts, (gsize) encoded->data.size, encoded->sync);
         g_mutex_unlock (&src->output_lock);
         return;
     }
 
-    rel_us = frame->timestamp_us - src->first_pts_us;
-    if (rel_us < 0 || rel_us > G_MAXINT64 / 1000) {
-        GST_ERROR_OBJECT (src, "codec PTS %" G_GINT64_FORMAT
-            "us is not representable relative to origin %" G_GINT64_FORMAT,
-            frame->timestamp_us, src->first_pts_us);
-        gst_droidscreencapsrc_set_error_locked (src, -ERANGE);
-        g_mutex_unlock (&src->output_lock);
-        return;
-    }
-    src->last_pts_us = frame->timestamp_us;
+    src->last_ts = encoded->ts;
 
     f = g_new0 (GstDroidScreenCapFrame, 1);
-    if (frame->sync) {
+    if (encoded->sync) {
         f->data = gst_droidscreencapsrc_copy_sync_frame_locked (src,
-            frame->data, frame->size, &f->size);
+            encoded->data.data, encoded->data.size, &f->size);
     } else {
-        f->data = g_memdup2 (frame->data, frame->size);
-        f->size = frame->size;
+        f->data = g_memdup2 (encoded->data.data, encoded->data.size);
+        f->size = encoded->data.size;
     }
-    f->pts = (GstClockTime) rel_us * 1000;
+    f->pts = encoded->ts - src->first_ts;
     f->duration = GST_CLOCK_TIME_NONE;
-    f->sync = frame->sync;
+    f->sync = encoded->sync;
 
     /* One-frame lookahead: the previous frame's duration is the gap to
      * this one. */
@@ -606,17 +591,9 @@ gst_droidscreencapsrc_data_available (void *user,
 }
 
 static void
-gst_droidscreencapsrc_format_changed (void *user, int width, int height)
+gst_droidscreencapsrc_error (void *data, int err)
 {
-    GstDroidScreenCapSrc *src = GST_DROIDSCREENCAPSRC (user);
-
-    GST_INFO_OBJECT (src, "encoder output format %dx%d", width, height);
-}
-
-static void
-gst_droidscreencapsrc_error (void *user, int err)
-{
-    GstDroidScreenCapSrc *src = GST_DROIDSCREENCAPSRC (user);
+    GstDroidScreenCapSrc *src = GST_DROIDSCREENCAPSRC (data);
 
     GST_ERROR_OBJECT (src, "encoder error %d (0x%x)", err, (unsigned) -err);
 
@@ -626,9 +603,9 @@ gst_droidscreencapsrc_error (void *user, int err)
 }
 
 static void
-gst_droidscreencapsrc_eos (void *user)
+gst_droidscreencapsrc_signal_eos (void *data)
 {
-    GstDroidScreenCapSrc *src = GST_DROIDSCREENCAPSRC (user);
+    GstDroidScreenCapSrc *src = GST_DROIDSCREENCAPSRC (data);
 
     GST_INFO_OBJECT (src, "encoder reached EOS");
 
@@ -664,7 +641,7 @@ gst_droidscreencapsrc_send_event (GstElement * element, GstEvent * event)
         if (src->running && !src->flushing) {
             if (!src->eos_requested) {
                 src->eos_requested = TRUE;
-                src->stop_time_us = g_get_monotonic_time ();
+                src->stop_time = g_get_monotonic_time () * 1000;
                 GST_INFO_OBJECT (src, "EOS requested; finishing encoder "
                     "gracefully");
             }
@@ -719,7 +696,7 @@ static gboolean
 gst_droidscreencapsrc_start (GstBaseSrc * bsrc)
 {
     GstDroidScreenCapSrc *src = GST_DROIDSCREENCAPSRC (bsrc);
-    ScreenCaptureSurfaceEncoderCallbacks cb;
+    DroidMediaScreenCaptureCallbacks cb;
 
     GST_DEBUG_OBJECT (src, "start");
 
@@ -746,13 +723,12 @@ gst_droidscreencapsrc_start (GstBaseSrc * bsrc)
     /* Create the Surface encoder. */
     memset (&cb, 0, sizeof (cb));
     cb.data_available = gst_droidscreencapsrc_data_available;
-    cb.format_changed = gst_droidscreencapsrc_format_changed;
     cb.error = gst_droidscreencapsrc_error;
-    cb.eos = gst_droidscreencapsrc_eos;
+    cb.signal_eos = gst_droidscreencapsrc_signal_eos;
 
-    src->encoder = screen_capture_surface_encoder_new (src->width, src->height,
+    src->capture = droid_media_screen_capture_new (src->width, src->height,
         src->target_bitrate, src->fps, &cb, src);
-    if (src->encoder == NULL) {
+    if (src->capture == NULL) {
         GST_ELEMENT_ERROR (src, LIBRARY, INIT,
             ("Failed to create the hardware AVC Surface encoder"),
             ("%dx%d @%d fps, %d bps", src->width, src->height, src->fps,
@@ -766,13 +742,13 @@ gst_droidscreencapsrc_start (GstBaseSrc * bsrc)
     g_mutex_unlock (&src->output_lock);
 
     /* Start MediaCodec and publish the producer generation. */
-    if (!screen_capture_surface_encoder_start (src->encoder)) {
+    if (!droid_media_screen_capture_start (src->capture)) {
         g_mutex_lock (&src->output_lock);
         src->running = FALSE;
         g_mutex_unlock (&src->output_lock);
 
-        screen_capture_surface_encoder_destroy (src->encoder);
-        src->encoder = NULL;
+        droid_media_screen_capture_destroy (src->capture);
+        src->capture = NULL;
 
         g_mutex_lock (&src->output_lock);
         gst_droidscreencapsrc_reset_run_state_locked (src);
@@ -818,10 +794,10 @@ gst_droidscreencapsrc_stop (GstBaseSrc * bsrc)
     /* 2. Bounded immediate stop, without holding output_lock: the drain
      * thread may be inside a callback that needs it. If a graceful finish is
      * still in progress on the streaming thread, this waits for it. */
-    if (src->encoder) {
-        screen_capture_surface_encoder_stop (src->encoder);
-        screen_capture_surface_encoder_destroy (src->encoder);
-        src->encoder = NULL;
+    if (src->capture) {
+        droid_media_screen_capture_stop (src->capture);
+        droid_media_screen_capture_destroy (src->capture);
+        src->capture = NULL;
     }
 
     /* 3. Discard everything for a clean restart. */
@@ -872,10 +848,10 @@ gst_droidscreencapsrc_do_finish (GstDroidScreenCapSrc * src)
 {
     gboolean ok = FALSE;
 
-    if (src->encoder) {
+    if (src->capture) {
         GST_INFO_OBJECT (src, "finishing encoder (timeout %d ms)",
             FINISH_TIMEOUT_MS);
-        ok = screen_capture_surface_encoder_finish (src->encoder,
+        ok = droid_media_screen_capture_finish (src->capture,
             FINISH_TIMEOUT_MS);
     }
 

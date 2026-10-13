@@ -23,6 +23,7 @@
 
 #include <gst/gst.h>
 #include <gst/base/gstpushsrc.h>
+#include "droidmediascreencapture.h"
 
 G_BEGIN_DECLS
 
@@ -49,9 +50,9 @@ struct _GstDroidScreenCapSrc {
     gint target_bitrate;
     gint fps;
 
-    /* ScreenCaptureSurfaceEncoder *, owned by the element between start()
-     * and stop(). Only touched from the streaming/state-change threads. */
-    void *encoder;
+    /* Owned by the element between start() and stop(). Only touched from
+     * the streaming/state-change threads. */
+    DroidMediaScreenCapture *capture;
 
     /*
      * output_lock protects everything below. Callbacks from the encoder drain
@@ -77,11 +78,11 @@ struct _GstDroidScreenCapSrc {
     guint8 *config_data;
     gsize config_size;
 
-    /* Timestamp normalization: MediaCodec PTS are absolute CLOCK_MONOTONIC
-     * microseconds; GstBuffer PTS = (pts_us - first_pts_us) * 1000. */
+    /* Timestamp normalization: codec timestamps are absolute CLOCK_MONOTONIC
+     * nanoseconds; GstBuffer PTS = ts - first_ts. */
     gboolean have_first_pts;
-    gint64 first_pts_us;
-    gint64 last_pts_us;
+    gint64 first_ts;
+    gint64 last_ts;
 
     /* Overload handling */
     gboolean waiting_for_keyframe;
@@ -96,7 +97,7 @@ struct _GstDroidScreenCapSrc {
     gboolean eos_requested;  /* downstream EOS received via send_event() */
     gboolean finish_started; /* streaming thread has begun encoder finish */
     gboolean eos;            /* all remaining data is in output_queue */
-    gint64 stop_time_us;     /* CLOCK_MONOTONIC us when EOS was requested */
+    gint64 stop_time;        /* CLOCK_MONOTONIC ns when EOS was requested */
     gint error;              /* first encoder error, 0 if none */
     gboolean error_posted;
 
