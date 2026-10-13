@@ -49,10 +49,6 @@ struct _GstDroidScreenCapSrc {
     gint target_bitrate;
     gint fps;
 
-    /* Dimensions resolved at start() (explicit or discovered) */
-    gint enc_width;
-    gint enc_height;
-
     /* ScreenCaptureSurfaceEncoder *, owned by the element between start()
      * and stop(). Only touched from the streaming/state-change threads. */
     void *encoder;

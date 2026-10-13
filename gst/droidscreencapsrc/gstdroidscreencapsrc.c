@@ -68,7 +68,6 @@
 #endif
 
 #include "gstdroidscreencapsrc.h"
-#include "droidmedia.h"
 #include "screen_capture_surface_encoder.h"
 #include <errno.h>
 #include <string.h>
@@ -77,8 +76,8 @@ GST_DEBUG_CATEGORY_EXTERN (gst_droid_screencapsrc_debug);
 #define GST_CAT_DEFAULT gst_droid_screencapsrc_debug
 
 /* Defaults */
-#define DEFAULT_WIDTH           0       /* 0: discover from sailfish.screencap */
-#define DEFAULT_HEIGHT          0
+#define DEFAULT_WIDTH           0       /* required */
+#define DEFAULT_HEIGHT          0       /* required */
 #define DEFAULT_TARGET_BITRATE  8000000
 #define DEFAULT_FPS             30
 
@@ -186,27 +185,33 @@ gst_droidscreencapsrc_class_init (GstDroidScreenCapSrcClass * klass)
 
     g_object_class_install_property (gobject_class, PROP_WIDTH,
         g_param_spec_int ("width", "Width",
-            "Capture width in pixels (0: query sailfish.screencap)",
+            "Recording width in pixels (required): the display width, or "
+            "the display height for a landscape recording",
             0, G_MAXINT, DEFAULT_WIDTH,
-            G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+            G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS |
+            GST_PARAM_MUTABLE_READY));
 
     g_object_class_install_property (gobject_class, PROP_HEIGHT,
         g_param_spec_int ("height", "Height",
-            "Capture height in pixels (0: query sailfish.screencap)",
+            "Recording height in pixels (required): the display height, or "
+            "the display width for a landscape recording",
             0, G_MAXINT, DEFAULT_HEIGHT,
-            G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+            G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS |
+            GST_PARAM_MUTABLE_READY));
 
     g_object_class_install_property (gobject_class, PROP_TARGET_BITRATE,
         g_param_spec_int ("target-bitrate", "Target Bitrate",
             "Target bitrate in bits per second", 1, G_MAXINT,
             DEFAULT_TARGET_BITRATE,
-            G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+            G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS |
+            GST_PARAM_MUTABLE_READY));
 
     g_object_class_install_property (gobject_class, PROP_FPS,
         g_param_spec_int ("fps", "FPS",
             "Nominal maximum frame rate published to the capture plugin",
             1, 120, DEFAULT_FPS,
-            G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+            G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS |
+            GST_PARAM_MUTABLE_READY));
 }
 
 static void
@@ -216,8 +221,6 @@ gst_droidscreencapsrc_init (GstDroidScreenCapSrc * src)
     src->height = DEFAULT_HEIGHT;
     src->target_bitrate = DEFAULT_TARGET_BITRATE;
     src->fps = DEFAULT_FPS;
-    src->enc_width = 0;
-    src->enc_height = 0;
     src->encoder = NULL;
 
     g_mutex_init (&src->output_lock);
@@ -689,12 +692,12 @@ gst_droidscreencapsrc_get_caps (GstBaseSrc * bsrc, GstCaps * filter)
     GstDroidScreenCapSrc *src = GST_DROIDSCREENCAPSRC (bsrc);
     GstCaps *caps;
 
-    if (src->enc_width > 0 && src->enc_height > 0) {
+    if (src->width > 0 && src->height > 0) {
         caps = gst_caps_new_simple ("video/x-h264",
             "stream-format", G_TYPE_STRING, "byte-stream",
             "alignment", G_TYPE_STRING, "au",
-            "width", G_TYPE_INT, src->enc_width,
-            "height", G_TYPE_INT, src->enc_height,
+            "width", G_TYPE_INT, src->width,
+            "height", G_TYPE_INT, src->height,
             "framerate", GST_TYPE_FRACTION, src->fps, 1,
             NULL);
     } else {
@@ -717,8 +720,6 @@ gst_droidscreencapsrc_start (GstBaseSrc * bsrc)
 {
     GstDroidScreenCapSrc *src = GST_DROIDSCREENCAPSRC (bsrc);
     ScreenCaptureSurfaceEncoderCallbacks cb;
-    gint width = src->width;
-    gint height = src->height;
 
     GST_DEBUG_OBJECT (src, "start");
 
@@ -729,23 +730,10 @@ gst_droidscreencapsrc_start (GstBaseSrc * bsrc)
     g_cond_broadcast (&src->output_cond);
     g_mutex_unlock (&src->output_lock);
 
-    /* 1. Dimensions: explicit, or discovered from the capture service. */
-    if (width <= 0 || height <= 0) {
-        int w = 0, h = 0;
-
-        if (droid_media_screen_capture_get_dimensions (&w, &h) == 0 &&
-            w > 0 && h > 0) {
-            width = w;
-            height = h;
-            GST_INFO_OBJECT (src, "discovered display dimensions %dx%d",
-                width, height);
-        } else {
-            GST_ELEMENT_ERROR (src, RESOURCE, SETTINGS,
-                ("Screen capture dimensions are unknown"),
-                ("sailfish.screencap published no dimensions; set the "
-                 "width and height properties explicitly"));
-            return FALSE;
-        }
+    if (src->width <= 0 || src->height <= 0) {
+        GST_ELEMENT_ERROR (src, RESOURCE, SETTINGS,
+            ("The width and height properties must be set"), (NULL));
+        return FALSE;
     }
 
     if (src->target_bitrate <= 0 || src->fps <= 0) {
@@ -755,34 +743,29 @@ gst_droidscreencapsrc_start (GstBaseSrc * bsrc)
         return FALSE;
     }
 
-    src->enc_width = width;
-    src->enc_height = height;
-
-    /* 2. Create the Surface encoder. */
+    /* Create the Surface encoder. */
     memset (&cb, 0, sizeof (cb));
     cb.data_available = gst_droidscreencapsrc_data_available;
     cb.format_changed = gst_droidscreencapsrc_format_changed;
     cb.error = gst_droidscreencapsrc_error;
     cb.eos = gst_droidscreencapsrc_eos;
 
-    src->encoder = screen_capture_surface_encoder_new (width, height,
+    src->encoder = screen_capture_surface_encoder_new (src->width, src->height,
         src->target_bitrate, src->fps, &cb, src);
     if (src->encoder == NULL) {
-        src->enc_width = 0;
-        src->enc_height = 0;
         GST_ELEMENT_ERROR (src, LIBRARY, INIT,
             ("Failed to create the hardware AVC Surface encoder"),
-            ("%dx%d @%d fps, %d bps", width, height, src->fps,
+            ("%dx%d @%d fps, %d bps", src->width, src->height, src->fps,
              src->target_bitrate));
         return FALSE;
     }
 
-    /* 3. Callbacks may fire as soon as the codec starts; accept them. */
+    /* Callbacks may fire as soon as the codec starts; accept them. */
     g_mutex_lock (&src->output_lock);
     src->running = TRUE;
     g_mutex_unlock (&src->output_lock);
 
-    /* 4. Start MediaCodec and publish the producer generation. */
+    /* Start MediaCodec and publish the producer generation. */
     if (!screen_capture_surface_encoder_start (src->encoder)) {
         g_mutex_lock (&src->output_lock);
         src->running = FALSE;
@@ -794,19 +777,17 @@ gst_droidscreencapsrc_start (GstBaseSrc * bsrc)
         g_mutex_lock (&src->output_lock);
         gst_droidscreencapsrc_reset_run_state_locked (src);
         g_mutex_unlock (&src->output_lock);
-        src->enc_width = 0;
-        src->enc_height = 0;
 
         GST_ELEMENT_ERROR (src, RESOURCE, OPEN_READ,
             ("Failed to start screen capture"),
-            ("Encoder start or sailfish.screencap producer registration "
-             "failed for %dx%d; check that lipstick capture is enabled and "
-             "the dimensions match the display", width, height));
+            ("could not start the encoder or register it with "
+             "sailfish.screencap; see logcat"));
         return FALSE;
     }
 
     GST_INFO_OBJECT (src, "started: %dx%d @%d fps, %d bps, queue bound %d "
-        "frames / %d bytes", width, height, src->fps, src->target_bitrate,
+        "frames / %d bytes", src->width, src->height, src->fps,
+        src->target_bitrate,
         OUTPUT_QUEUE_MAX_FRAMES, OUTPUT_QUEUE_MAX_BYTES);
     return TRUE;
 }
@@ -848,9 +829,6 @@ gst_droidscreencapsrc_stop (GstBaseSrc * bsrc)
     gst_droidscreencapsrc_reset_run_state_locked (src);
     src->flushing = FALSE;
     g_mutex_unlock (&src->output_lock);
-
-    src->enc_width = 0;
-    src->enc_height = 0;
 
     return TRUE;
 }
