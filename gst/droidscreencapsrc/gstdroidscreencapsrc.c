@@ -49,7 +49,7 @@ GST_DEBUG_CATEGORY_EXTERN (gst_droid_screencapsrc_debug);
 #define DEFAULT_WIDTH           0       /* required */
 #define DEFAULT_HEIGHT          0       /* required */
 #define DEFAULT_TARGET_BITRATE  8000000
-#define DEFAULT_FPS             30
+#define DEFAULT_FPS             60
 
 /* On overflow, queued access units are dropped up to the next IDR. */
 #define OUTPUT_QUEUE_MAX_FRAMES 30
@@ -161,7 +161,8 @@ gst_droidscreencapsrc_class_init (GstDroidScreenCapSrcClass * klass)
 
   g_object_class_install_property (gobject_class, PROP_FPS,
       g_param_spec_int ("fps", "FPS",
-          "Nominal maximum frame rate published to the capture plugin",
+          "Nominal frame rate for the encoder and the caps. The compositor "
+          "sends every frame it renders, so use the display refresh rate",
           1, 120, DEFAULT_FPS,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS |
           GST_PARAM_MUTABLE_READY));
