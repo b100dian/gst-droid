@@ -59,7 +59,6 @@ struct _GstDroidScreenCapSrc
 
   GQueue *output_queue;
   gsize queue_bytes;
-  GstBuffer *pending;           /* waits for the next AU to get a duration */
   guint8 *config_data;          /* newest SPS/PPS */
   gsize config_size;
 
@@ -80,7 +79,6 @@ struct _GstDroidScreenCapSrc
   gboolean eos_requested;
   gboolean finish_started;
   gboolean eos;                 /* everything left is in output_queue */
-  gint64 stop_time;             /* CLOCK_MONOTONIC ns of the EOS request */
   gint error;
   gboolean error_posted;
 

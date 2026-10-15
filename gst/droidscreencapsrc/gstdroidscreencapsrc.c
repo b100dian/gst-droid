@@ -198,7 +198,6 @@ static void
 gst_droidscreencapsrc_reset_run_state_locked (GstDroidScreenCapSrc * src)
 {
   gst_droidscreencapsrc_clear_queue_locked (src);
-  gst_buffer_replace (&src->pending, NULL);
   g_free (src->config_data);
   src->config_data = NULL;
   src->config_size = 0;
@@ -216,7 +215,6 @@ gst_droidscreencapsrc_reset_run_state_locked (GstDroidScreenCapSrc * src)
   src->eos_requested = FALSE;
   src->finish_started = FALSE;
   src->eos = FALSE;
-  src->stop_time = 0;
   src->error = 0;
   src->error_posted = FALSE;
   src->frames_out = 0;
@@ -289,38 +287,6 @@ gst_droidscreencapsrc_enqueue_locked (GstDroidScreenCapSrc * src,
   g_queue_push_tail (src->output_queue, buf);
   src->queue_bytes += size;
   g_cond_signal (&src->output_cond);
-}
-
-/* The last access unit lasts until the recording stopped. */
-static void
-gst_droidscreencapsrc_finalize_pending_locked (GstDroidScreenCapSrc * src)
-{
-  GstBuffer *buf = src->pending;
-  GstClockTime pts;
-  gint64 rel;
-
-  if (buf == NULL)
-    return;
-  src->pending = NULL;
-
-  pts = GST_BUFFER_PTS (buf);
-  rel = (src->stop_time != 0 ? src->stop_time :
-      g_get_monotonic_time () * 1000) - src->first_ts;
-
-  if (rel > 0 && (GstClockTime) rel > pts) {
-    GST_BUFFER_DURATION (buf) = (GstClockTime) rel - pts;
-    GST_INFO_OBJECT (src, "final frame PTS %" GST_TIME_FORMAT
-        " duration %" GST_TIME_FORMAT " (to recording stop)",
-        GST_TIME_ARGS (pts), GST_TIME_ARGS (GST_BUFFER_DURATION (buf)));
-  } else {
-    GST_BUFFER_DURATION (buf) =
-        gst_util_uint64_scale_int (GST_SECOND, 1, src->fps);
-    GST_WARNING_OBJECT (src, "recording stop time is not later than the "
-        "final PTS %" GST_TIME_FORMAT "; using one nominal frame period",
-        GST_TIME_ARGS (pts));
-  }
-
-  gst_droidscreencapsrc_enqueue_locked (src, buf);
 }
 
 static void
@@ -452,16 +418,6 @@ gst_droidscreencapsrc_data_available (void *data, DroidMediaCodecData * encoded)
   src->last_ts = encoded->ts;
   pts = encoded->ts - src->first_ts;
 
-  /* Each access unit waits for the next one, so that its duration covers
-   * any idle gap up to it. */
-  if (src->pending) {
-    GstBuffer *prev = src->pending;
-
-    src->pending = NULL;
-    GST_BUFFER_DURATION (prev) = pts - GST_BUFFER_PTS (prev);
-    gst_droidscreencapsrc_enqueue_locked (src, prev);
-  }
-
   if (src->waiting_for_keyframe) {
     if (!encoded->sync) {
       src->dropped_frames++;
@@ -484,8 +440,12 @@ gst_droidscreencapsrc_data_available (void *data, DroidMediaCodecData * encoded)
     g_mutex_unlock (&src->output_lock);
     return;
   }
+
+  /* No duration: it is only known once the next access unit arrives, and
+   * waiting for that would keep the last frame of a still screen from a
+   * live viewer. */
   GST_BUFFER_PTS (buf) = pts;
-  src->pending = buf;
+  gst_droidscreencapsrc_enqueue_locked (src, buf);
   g_mutex_unlock (&src->output_lock);
 }
 
@@ -509,10 +469,7 @@ gst_droidscreencapsrc_signal_eos (void *data)
   GST_INFO_OBJECT (src, "encoder reached EOS");
 
   g_mutex_lock (&src->output_lock);
-  if (!src->eos) {
-    gst_droidscreencapsrc_finalize_pending_locked (src);
-    src->eos = TRUE;
-  }
+  src->eos = TRUE;
   g_cond_broadcast (&src->output_cond);
   g_mutex_unlock (&src->output_lock);
 }
@@ -535,7 +492,6 @@ gst_droidscreencapsrc_send_event (GstElement * element, GstEvent * event)
     if (src->running && !src->flushing) {
       if (!src->eos_requested) {
         src->eos_requested = TRUE;
-        src->stop_time = g_get_monotonic_time () * 1000;
         GST_INFO_OBJECT (src, "EOS requested; finishing encoder gracefully");
       }
       g_cond_broadcast (&src->output_cond);
@@ -737,11 +693,8 @@ gst_droidscreencapsrc_do_finish (GstDroidScreenCapSrc * src)
     GST_WARNING_OBJECT (src, "encoder did not reach codec EOS; "
         "finalizing with the data received so far");
   }
-  if (!src->eos) {
-    /* The output thread has stopped; nothing more can arrive. */
-    gst_droidscreencapsrc_finalize_pending_locked (src);
-    src->eos = TRUE;
-  }
+  /* The output thread has stopped; nothing more can arrive. */
+  src->eos = TRUE;
   g_cond_broadcast (&src->output_cond);
   g_mutex_unlock (&src->output_lock);
 }
