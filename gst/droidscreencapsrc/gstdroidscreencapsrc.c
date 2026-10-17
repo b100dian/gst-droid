@@ -55,7 +55,7 @@ GST_DEBUG_CATEGORY_EXTERN (gst_droid_screencapsrc_debug);
 #define OUTPUT_QUEUE_MAX_FRAMES 30
 #define OUTPUT_QUEUE_MAX_BYTES  (8 * 1024 * 1024)
 
-/* Bound for draining the encoder at EOS, after its 500 ms detach grace. */
+/* Bound for draining the encoder at EOS, after its 100 ms detach grace. */
 #define FINISH_TIMEOUT_MS       3000
 
 enum
