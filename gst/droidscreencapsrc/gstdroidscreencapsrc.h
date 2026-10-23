@@ -49,6 +49,8 @@ struct _GstDroidScreenCapSrc
   gint height;
   gint target_bitrate;
   gint fps;
+  gint profile;                 /* DroidMediaCodecH264Profile, 0: encoder's */
+  gint level;                   /* level_idc, 0: lowest that fits */
 
   /* between start() and stop() */
   DroidMediaScreenCapture *capture;

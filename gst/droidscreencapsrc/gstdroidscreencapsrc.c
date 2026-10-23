@@ -50,12 +50,14 @@ GST_DEBUG_CATEGORY_EXTERN (gst_droid_screencapsrc_debug);
 #define DEFAULT_HEIGHT          0       /* required */
 #define DEFAULT_TARGET_BITRATE  8000000
 #define DEFAULT_FPS             60
+#define DEFAULT_PROFILE         0       /* the encoder's */
+#define DEFAULT_LEVEL           0       /* the lowest that fits */
 
 /* On overflow, queued access units are dropped up to the next IDR. */
 #define OUTPUT_QUEUE_MAX_FRAMES 30
 #define OUTPUT_QUEUE_MAX_BYTES  (8 * 1024 * 1024)
 
-/* Bound for draining the encoder at EOS, after its 100 ms detach grace. */
+/* Bound for draining the encoder at EOS, after droidmedia's detach grace. */
 #define FINISH_TIMEOUT_MS       3000
 
 enum
@@ -65,7 +67,66 @@ enum
   PROP_HEIGHT,
   PROP_TARGET_BITRATE,
   PROP_FPS,
+  PROP_PROFILE,
+  PROP_LEVEL,
 };
+
+#define GST_TYPE_DROIDSCREENCAPSRC_PROFILE \
+  (gst_droidscreencapsrc_profile_get_type ())
+
+static GType
+gst_droidscreencapsrc_profile_get_type (void)
+{
+  static GType type = 0;
+  static const GEnumValue profiles[] = {
+    {DEFAULT_PROFILE, "Encoder default", "default"},
+    {DROID_MEDIA_CODEC_H264_PROFILE_CONSTRAINED_BASELINE,
+        "Constrained Baseline", "constrained-baseline"},
+    {DROID_MEDIA_CODEC_H264_PROFILE_BASELINE, "Baseline", "baseline"},
+    {DROID_MEDIA_CODEC_H264_PROFILE_MAIN, "Main", "main"},
+    {DROID_MEDIA_CODEC_H264_PROFILE_HIGH, "High", "high"},
+    {0, NULL, NULL}
+  };
+
+  if (!type)
+    type = g_enum_register_static ("GstDroidScreenCapSrcProfile", profiles);
+  return type;
+}
+
+/* level_idc (level times 10) to the droidmedia level, 0 if unknown. */
+static gint
+gst_droidscreencapsrc_level (gint level_idc)
+{
+  static const struct
+  {
+    gint level_idc;
+    gint level;
+  } levels[] = {
+    {10, DROID_MEDIA_CODEC_H264_LEVEL_1},
+    {11, DROID_MEDIA_CODEC_H264_LEVEL_11},
+    {12, DROID_MEDIA_CODEC_H264_LEVEL_12},
+    {13, DROID_MEDIA_CODEC_H264_LEVEL_13},
+    {20, DROID_MEDIA_CODEC_H264_LEVEL_2},
+    {21, DROID_MEDIA_CODEC_H264_LEVEL_21},
+    {22, DROID_MEDIA_CODEC_H264_LEVEL_22},
+    {30, DROID_MEDIA_CODEC_H264_LEVEL_3},
+    {31, DROID_MEDIA_CODEC_H264_LEVEL_31},
+    {32, DROID_MEDIA_CODEC_H264_LEVEL_32},
+    {40, DROID_MEDIA_CODEC_H264_LEVEL_4},
+    {41, DROID_MEDIA_CODEC_H264_LEVEL_41},
+    {42, DROID_MEDIA_CODEC_H264_LEVEL_42},
+    {50, DROID_MEDIA_CODEC_H264_LEVEL_5},
+    {51, DROID_MEDIA_CODEC_H264_LEVEL_51},
+    {52, DROID_MEDIA_CODEC_H264_LEVEL_52},
+  };
+  guint i;
+
+  for (i = 0; i < G_N_ELEMENTS (levels); i++) {
+    if (levels[i].level_idc == level_idc)
+      return levels[i].level;
+  }
+  return 0;
+}
 
 /* framerate in the caps is nominal: idle periods carry no access units. */
 static GstStaticPadTemplate gst_droidscreencapsrc_src_template =
@@ -166,6 +227,21 @@ gst_droidscreencapsrc_class_init (GstDroidScreenCapSrcClass * klass)
           1, 120, DEFAULT_FPS,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS |
           GST_PARAM_MUTABLE_READY));
+
+  g_object_class_install_property (gobject_class, PROP_PROFILE,
+      g_param_spec_enum ("profile", "Profile",
+          "H.264 profile. default leaves profile and level to the encoder",
+          GST_TYPE_DROIDSCREENCAPSRC_PROFILE, DEFAULT_PROFILE,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS |
+          GST_PARAM_MUTABLE_READY));
+
+  g_object_class_install_property (gobject_class, PROP_LEVEL,
+      g_param_spec_int ("level", "Level",
+          "H.264 level times 10 (31 is level 3.1), or 0 for the lowest level "
+          "that fits size, fps and bitrate. Needs a profile",
+          0, 52, DEFAULT_LEVEL,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS |
+          GST_PARAM_MUTABLE_READY));
 }
 
 static void
@@ -175,6 +251,8 @@ gst_droidscreencapsrc_init (GstDroidScreenCapSrc * src)
   src->height = DEFAULT_HEIGHT;
   src->target_bitrate = DEFAULT_TARGET_BITRATE;
   src->fps = DEFAULT_FPS;
+  src->profile = DEFAULT_PROFILE;
+  src->level = DEFAULT_LEVEL;
 
   g_mutex_init (&src->output_lock);
   g_cond_init (&src->output_cond);
@@ -329,6 +407,12 @@ gst_droidscreencapsrc_set_property (GObject * object, guint prop_id,
     case PROP_FPS:
       src->fps = g_value_get_int (value);
       break;
+    case PROP_PROFILE:
+      src->profile = g_value_get_enum (value);
+      break;
+    case PROP_LEVEL:
+      src->level = g_value_get_int (value);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
@@ -353,6 +437,12 @@ gst_droidscreencapsrc_get_property (GObject * object, guint prop_id,
       break;
     case PROP_FPS:
       g_value_set_int (value, src->fps);
+      break;
+    case PROP_PROFILE:
+      g_value_set_enum (value, src->profile);
+      break;
+    case PROP_LEVEL:
+      g_value_set_int (value, src->level);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -542,6 +632,8 @@ gst_droidscreencapsrc_start (GstBaseSrc * bsrc)
 {
   GstDroidScreenCapSrc *src = GST_DROIDSCREENCAPSRC (bsrc);
   DroidMediaScreenCaptureCallbacks cb;
+  DroidMediaCodecEncoderMetaData meta;
+  gint level = 0;
 
   GST_DEBUG_OBJECT (src, "start");
 
@@ -565,13 +657,31 @@ gst_droidscreencapsrc_start (GstBaseSrc * bsrc)
     return FALSE;
   }
 
+  if (src->level != 0) {
+    level = gst_droidscreencapsrc_level (src->level);
+    if (level == 0 || src->profile == DEFAULT_PROFILE) {
+      GST_ELEMENT_ERROR (src, RESOURCE, SETTINGS,
+          ("Invalid H.264 level"),
+          ("level=%d needs a profile and one of 10-13, 20-22, 30-32, 40-42, "
+              "50-52", src->level));
+      return FALSE;
+    }
+  }
+
+  memset (&meta, 0, sizeof (meta));
+  meta.parent.width = src->width;
+  meta.parent.height = src->height;
+  meta.parent.fps = src->fps;
+  meta.bitrate = src->target_bitrate;
+  meta.codec_specific.h264.profile = src->profile;
+  meta.codec_specific.h264.level = level;
+
   memset (&cb, 0, sizeof (cb));
   cb.data_available = gst_droidscreencapsrc_data_available;
   cb.error = gst_droidscreencapsrc_error;
   cb.signal_eos = gst_droidscreencapsrc_signal_eos;
 
-  src->capture = droid_media_screen_capture_new (src->width, src->height,
-      src->target_bitrate, src->fps, &cb, src);
+  src->capture = droid_media_screen_capture_new (&meta, &cb, src);
   if (src->capture == NULL) {
     GST_ELEMENT_ERROR (src, LIBRARY, INIT,
         ("Failed to create the hardware AVC Surface encoder"),
@@ -604,9 +714,10 @@ gst_droidscreencapsrc_start (GstBaseSrc * bsrc)
     return FALSE;
   }
 
-  GST_INFO_OBJECT (src, "started: %dx%d @%d fps, %d bps, queue bound %d "
-      "frames / %d bytes", src->width, src->height, src->fps,
-      src->target_bitrate, OUTPUT_QUEUE_MAX_FRAMES, OUTPUT_QUEUE_MAX_BYTES);
+  GST_INFO_OBJECT (src, "started: %dx%d @%d fps, %d bps, profile 0x%x level "
+      "%d, queue bound %d frames / %d bytes", src->width, src->height, src->fps,
+      src->target_bitrate, src->profile, src->level, OUTPUT_QUEUE_MAX_FRAMES,
+      OUTPUT_QUEUE_MAX_BYTES);
   return TRUE;
 }
 
