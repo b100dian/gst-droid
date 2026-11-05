@@ -51,8 +51,13 @@ struct _GstDroidScreenCapSrc
   gint fps;
   gint profile;                 /* DroidMediaCodecH264Profile, 0: encoder's */
   gint level;                   /* level_idc, 0: lowest that fits */
+  gint target;                  /* DroidMediaScreenCaptureTarget */
+  DroidMediaRect content_rect;  /* all 0: the whole frame */
 
-  /* between start() and stop() */
+  /* Between start() and stop(). The streaming and output threads use it
+   * freely; any other thread holds capture_lock, which stop() takes to clear
+   * it. */
+  GMutex capture_lock;
   DroidMediaScreenCapture *capture;
 
   /* Protects everything below. Never held while calling into capture. */
