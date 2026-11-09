@@ -54,9 +54,9 @@ struct _GstDroidScreenCapSrc
   gint target;                  /* DroidMediaScreenCaptureTarget */
   DroidMediaRect content_rect;  /* all 0: the whole frame */
 
-  /* Between start() and stop(). The streaming and output threads use it
-   * freely; any other thread holds capture_lock, which stop() takes to clear
-   * it. */
+  /* Set between start() and stop(), under the state lock. The streaming and
+   * output threads use it freely; a thread without the state lock holds
+   * capture_lock, which stop() takes to clear it. */
   GMutex capture_lock;
   DroidMediaScreenCapture *capture;
 
@@ -65,9 +65,6 @@ struct _GstDroidScreenCapSrc
   GCond output_cond;
 
   GQueue *output_queue;
-  gsize queue_bytes;
-  guint8 *config_data;          /* newest SPS/PPS */
-  gsize config_size;
 
   /* PTS = ts - first_ts, both in CLOCK_MONOTONIC ns */
   gboolean have_first_pts;
@@ -77,17 +74,11 @@ struct _GstDroidScreenCapSrc
   /* overload: drop up to the next IDR */
   gboolean waiting_for_keyframe;
   guint dropped_frames;
-  gsize dropped_bytes;
-  guint overload_episodes;
-  guint duplicate_pts_frames;
 
-  gboolean running;
-  gboolean flushing;
+  gboolean flushing;            /* between unlock() and unlock_stop() */
   gboolean eos_requested;
-  gboolean finish_started;
   gboolean eos;                 /* everything left is in output_queue */
   gint error;
-  gboolean error_posted;
 
   guint64 frames_out;
 };
